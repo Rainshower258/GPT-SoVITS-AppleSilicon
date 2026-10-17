@@ -14,6 +14,8 @@ pretrained_sovits_name = {
     "v2": "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
     "v3": "GPT_SoVITS/pretrained_models/s2Gv3.pth",  ###v3v4还要检查vocoder，算了。。。
     "v4": "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth",
+    "v5dev": "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5dev.pth",
+    "v5turbo": "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth",
     "v2Pro": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth",
     "v2ProPlus": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth",
 }
@@ -23,10 +25,14 @@ pretrained_gpt_name = {
     "v2": "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt",
     "v3": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
     "v4": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+    "v5dev": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+    "v5turbo": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
     "v2Pro": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
     "v2ProPlus": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
 }
 name2sovits_path = {
+    i18n("不训练直接推v5dev底模！"): pretrained_sovits_name["v5dev"],
+    i18n("不训练直接推v5turbo底模！"): pretrained_sovits_name["v5turbo"],
     # i18n("不训练直接推v1底模！"): "GPT_SoVITS/pretrained_models/s2G488k.pth",
     i18n("不训练直接推v2底模！"): "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
     # i18n("不训练直接推v3底模！"): "GPT_SoVITS/pretrained_models/s2Gv3.pth",
@@ -46,6 +52,8 @@ SoVITS_weight_root = [
     "SoVITS_weights_v2",
     "SoVITS_weights_v3",
     "SoVITS_weights_v4",
+    "SoVITS_weights_v5dev",
+    "SoVITS_weights_v5turbo",
     "SoVITS_weights_v2Pro",
     "SoVITS_weights_v2ProPlus",
 ]
@@ -54,6 +62,8 @@ GPT_weight_root = [
     "GPT_weights_v2",
     "GPT_weights_v3",
     "GPT_weights_v4",
+    "GPT_weights_v5dev",
+    "GPT_weights_v5turbo",
     "GPT_weights_v2Pro",
     "GPT_weights_v2ProPlus",
 ]
@@ -62,6 +72,8 @@ SoVITS_weight_version2root = {
     "v2": "SoVITS_weights_v2",
     "v3": "SoVITS_weights_v3",
     "v4": "SoVITS_weights_v4",
+    "v5dev": "SoVITS_weights_v5dev",
+    "v5turbo": "SoVITS_weights_v5turbo",
     "v2Pro": "SoVITS_weights_v2Pro",
     "v2ProPlus": "SoVITS_weights_v2ProPlus",
 }
@@ -70,6 +82,8 @@ GPT_weight_version2root = {
     "v2": "GPT_weights_v2",
     "v3": "GPT_weights_v3",
     "v4": "GPT_weights_v4",
+    "v5dev": "GPT_weights_v5dev",
+    "v5turbo": "GPT_weights_v5turbo",
     "v2Pro": "GPT_weights_v2Pro",
     "v2ProPlus": "GPT_weights_v2ProPlus",
 }
@@ -150,6 +164,9 @@ def get_device_dtype_sm(idx: int) -> tuple[torch.device, torch.dtype, float, flo
     cpu = torch.device("cpu")
     cuda = torch.device(f"cuda:{idx}")
     if not torch.cuda.is_available():
+        if torch.backends.mps.is_available():
+            # is_half 先固定False，fp16留到单独验证；sm_version/mem_gb 填0仅作占位，不参与MPS路径的精度判断
+            return torch.device("mps"), torch.float32, 0.0, 0.0
         return cpu, torch.float32, 0.0, 0.0
     device_idx = idx
     capability = torch.cuda.get_device_capability(device_idx)
@@ -182,9 +199,13 @@ for i in range(max(GPU_COUNT, 1)):
 for j in tmp:
     device = j[0]
     memset.add(j[3])
-    if device.type != "cpu":
+    if device.type == "cuda":
         GPU_INFOS.append(f"{device.index}\t{torch.cuda.get_device_name(device.index)}")
         GPU_INDEX.add(device.index)
+    # 注意：mps 故意不进这里。IS_GPU/GPU_INFOS/GPU_INDEX 喂给的是 webui.py 的训练 GPU
+    # 选择器（set_gpu_numbers -> s2_train.py 等），不是推理设备——训练走 MPS 官方都没验证过
+    # （README 里也提示 Mac GPU 训练出来的模型质量明显更差）。infer_device（下面）不受这里影响，
+    # 照样会解析成 mps，推理端的 MPS 自动检测不受影响。
 
 if not GPU_INFOS:
     IS_GPU = False

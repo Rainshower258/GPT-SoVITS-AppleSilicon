@@ -26,6 +26,7 @@ from BigVGAN.bigvgan import BigVGAN
 from feature_extractor.cnhubert import CNHubert
 from module.mel_processing import mel_spectrogram_torch, spectrogram_torch
 from module.models import SynthesizerTrn, SynthesizerTrnV3, Generator
+from module.models_v5 import synthesize_v5_mel, V5_VERSIONS
 from peft import LoraConfig, get_peft_model
 from process_ckpt import get_sovits_version_from_path_fast, load_sovits_new
 from transformers import AutoModelForMaskedLM, AutoTokenizer
@@ -271,6 +272,12 @@ class TTS_Config:
             "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
         },
     }
+    # V5（上游 cuda_graph_accel_v5 分支，2026-10）：T2S 仍是 s1v3.ckpt，只换 SoVITS + vocoder
+    for _v5 in V5_VERSIONS:
+        default_configs[_v5] = dict(
+            default_configs["v4"], version=_v5,
+            vits_weights_path=f"GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2G{_v5}.pth",
+        )
     configs: dict = None
     v1_languages: list = ["auto", "en", "zh", "ja", "all_zh", "all_ja"]
     v2_languages: list = ["auto", "auto_yue", "en", "zh", "ja", "yue", "ko", "all_zh", "all_ja", "all_yue", "all_ko"]
@@ -282,6 +289,8 @@ class TTS_Config:
         "v2ProPlus": 486,
         "v3" : 486,
         "v4" : 486,
+        "v5dev": 486,
+        "v5turbo": 486,
     }
     mute_emb_sim_matrix: torch.Tensor = None
     # "all_zh",#全部按中文识别
@@ -320,17 +329,36 @@ class TTS_Config:
 
         self.device = self.configs.get("device", torch.device("cpu"))
         if "cuda" in str(self.device) and not torch.cuda.is_available():
-            print("Warning: CUDA is not available, set device to CPU.")
-            self.device = torch.device("cpu")
+            if torch.backends.mps.is_available():
+                print("Warning: CUDA is not available, set device to MPS.")
+                self.device = torch.device("mps")
+            else:
+                print("Warning: CUDA is not available, set device to CPU.")
+                self.device = torch.device("cpu")
 
         self.is_half = self.configs.get("is_half", False)
         if str(self.device) == "cpu" and self.is_half:
             print(f"Warning: Half precision is not supported on CPU, set is_half to False.")
             self.is_half = False
 
+        # 混合设备：T2S（自回归解码，dispatch-bound）和 VITS（一次性卷积前向，compute-bound）
+        # 在 MPS 上的强弱正好相反，
+        # 允许两者跑在不同设备上取长补短。默认不设置就等于 self.device，完全向后兼容。
+        t2s_device = self.configs.get("t2s_device", None)
+        self.t2s_device = torch.device(t2s_device) if t2s_device not in [None, ""] else self.device
+        # MLX：T2S 后端。"torch"（默认，走 t2s_device）或 "mlx"（Apple GPU，见 Accel/mlx_t2s.py，
+        # 只接管非流式路径；流式路径仍走 torch）。t2s_mlx_dtype: float16(默认)/float32/bfloat16；
+        # t2s_mlx_quant: 空/Affine(int8 g32)；t2s_mlx_backend: mlx_varlen(默认)/mlx_static
+        self.t2s_backend = str(self.configs.get("t2s_backend", "torch") or "torch").lower()
+        assert self.t2s_backend in ["torch", "mlx"], "t2s_backend must be torch or mlx"
+        self.t2s_mlx_dtype = str(self.configs.get("t2s_mlx_dtype", "float16") or "float16")
+        self.t2s_mlx_quant = self.configs.get("t2s_mlx_quant", None) or None
+        self.t2s_mlx_backend = str(self.configs.get("t2s_mlx_backend", "mlx_varlen") or "mlx_varlen")
+        self.t2s_mlx_compile = bool(self.configs.get("t2s_mlx_compile", False))  # MLX 局部编译 局部编译
+
         version = self.configs.get("version", None)
         self.version = version
-        assert self.version in ["v1", "v2", "v3", "v4", "v2Pro", "v2ProPlus"], "Invalid version!"
+        assert self.version in ["v1", "v2", "v3", "v4", "v2Pro", "v2ProPlus", "v5dev", "v5turbo"], "Invalid version!"
         self.t2s_weights_path = self.configs.get("t2s_weights_path", None)
         self.vits_weights_path = self.configs.get("vits_weights_path", None)
         self.bert_base_path = self.configs.get("bert_base_path", None)
@@ -387,6 +415,12 @@ class TTS_Config:
     def update_configs(self):
         self.config = {
             "device": str(self.device),
+            "t2s_device": str(self.t2s_device),
+            "t2s_backend": self.t2s_backend,
+            "t2s_mlx_dtype": self.t2s_mlx_dtype,
+            "t2s_mlx_quant": self.t2s_mlx_quant,
+            "t2s_mlx_backend": self.t2s_mlx_backend,
+            "t2s_mlx_compile": self.t2s_mlx_compile,
             "is_half": self.is_half,
             "version": self.version,
             "t2s_weights_path": self.t2s_weights_path,
@@ -426,6 +460,7 @@ class TTS:
             self.configs: TTS_Config = TTS_Config(configs)
 
         self.t2s_model: Text2SemanticLightningModule = None
+        self.t2s_mlx = None  # MLX：MLX T2S 引擎（t2s_backend == "mlx" 时在 init_t2s_weights 里建）
         self.vits_model: Union[SynthesizerTrn, SynthesizerTrnV3] = None
         self.bert_tokenizer: AutoTokenizer = None
         self.bert_model: AutoModelForMaskedLM = None
@@ -512,7 +547,7 @@ class TTS:
         else:
             hps["model"]["version"] = "v2"
         version = hps["model"]["version"]
-        v3v4set = {"v3", "v4"}
+        v3v4set = {"v3", "v4"} | V5_VERSIONS
         if model_version not in v3v4set:
             if "Pro" not in model_version:
                 model_version = version
@@ -596,16 +631,31 @@ class TTS:
         self.configs.t2s_weights_path = weights_path
         self.configs.save_configs()
         self.configs.hz = 50
-        dict_s1 = torch.load(weights_path, map_location=self.configs.device, weights_only=False)
+        # 混合设备：T2S 权重放到 t2s_device（默认等于 device，混合部署时可以单独指定，
+        # 比如 CPU——自回归 decode 在 MPS 上是 dispatch-bound，CPU 反而更快）
+        dict_s1 = torch.load(weights_path, map_location=self.configs.t2s_device, weights_only=False)
         config = dict_s1["config"]
         self.configs.max_sec = config["data"]["max_sec"]
         t2s_model = Text2SemanticLightningModule(config, "****", is_train=False)
         t2s_model.load_state_dict(dict_s1["weight"])
-        t2s_model = t2s_model.to(self.configs.device)
+        t2s_model = t2s_model.to(self.configs.t2s_device)
         t2s_model = t2s_model.eval()
         self.t2s_model = t2s_model
-        if self.configs.is_half and str(self.configs.device) != "cpu":
+        if self.configs.is_half and str(self.configs.t2s_device) != "cpu":
             self.t2s_model = self.t2s_model.half()
+
+        self.t2s_mlx = None
+        if self.configs.t2s_backend == "mlx":
+            from Accel.mlx_t2s import MLXT2S
+
+            self.t2s_mlx = MLXT2S(
+                weights_path,
+                backend=self.configs.t2s_mlx_backend,
+                dtype=self.configs.t2s_mlx_dtype,
+                quantize=self.configs.t2s_mlx_quant,
+                compile=self.configs.t2s_mlx_compile,
+            )
+            print(f"T2S MLX engine ready: {self.t2s_mlx.load_info}")
 
         codebook = t2s_model.model.ar_audio_embedding.weight.clone()
         mute_emb = codebook[self.configs.mute_tokens[self.configs.version]].unsqueeze(0)
@@ -633,8 +683,9 @@ class TTS:
             self.vocoder_configs["upsample_rate"] = 256
             self.vocoder_configs["overlapped_len"] = 12
 
-        elif version == "v4":
-            if self.vocoder is not None and self.vocoder.__class__.__name__ == "Generator":
+        elif version in ({"v4"} | V5_VERSIONS):
+            if (self.vocoder is not None and self.vocoder.__class__.__name__ == "Generator"
+                    and getattr(self, "_vocoder_version", None) == version):
                 return
             if self.vocoder is not None:
                 self.vocoder.cpu()
@@ -654,7 +705,8 @@ class TTS:
             )
             self.vocoder.remove_weight_norm()
             state_dict_g = torch.load(
-                "%s/GPT_SoVITS/pretrained_models/gsv-v4-pretrained/vocoder.pth" % (now_dir,),
+                "%s/GPT_SoVITS/pretrained_models/gsv-%s-pretrained/vocoder.pth"
+                % (now_dir, "v5" if version in V5_VERSIONS else version),
                 map_location="cpu",
                 weights_only=False,
             )
@@ -667,6 +719,7 @@ class TTS:
             self.vocoder_configs["overlapped_len"] = 12
 
         self.vocoder = self.vocoder.eval()
+        self._vocoder_version = version
         if self.configs.is_half == True:
             self.vocoder = self.vocoder.half().to(self.configs.device)
         else:
@@ -1051,9 +1104,17 @@ class TTS:
         seed = inputs.get("seed", -1)
         seed = -1 if seed in ["", None] else seed
         actual_seed = set_seed(seed)
+        if self.t2s_mlx is not None:
+            import mlx.core as mx
+
+            mx.random.seed(int(actual_seed))
         parallel_infer = inputs.get("parallel_infer", True)
         repetition_penalty = inputs.get("repetition_penalty", 1.35)
-        sample_steps = inputs.get("sample_steps", 32)
+        sample_steps = inputs.get("sample_steps")
+        cfg_rate = inputs.get("cfg_rate")
+        # V5：turbo 默认 4 步无 CFG，dev 默认 32 步 CFG 1.30；其它版本保持 32 步 / 0
+        sample_steps = (4 if self.configs.version == "v5turbo" else 32) if sample_steps is None else int(sample_steps)
+        cfg_rate = (1.30 if self.configs.version == "v5dev" else 0.0) if cfg_rate is None else float(cfg_rate)
         super_sampling = inputs.get("super_sampling", False)
         streaming_mode = inputs.get("streaming_mode", False)
         overlap_length = inputs.get("overlap_length", 2)
@@ -1264,22 +1325,52 @@ class TTS:
 
                 if not streaming_mode:
                     print(f"############ {i18n('预测语义Token')} ############")
-                    pred_semantic_list, idx_list = self.t2s_model.model.infer_panel(
-                        all_phoneme_ids,
-                        all_phoneme_lens,
-                        prompt,
-                        all_bert_features,
-                        # prompt_phone_len=ph_offset,
-                        top_k=top_k,
-                        top_p=top_p,
-                        temperature=temperature,
-                        early_stop_num=self.configs.hz * self.configs.max_sec,
-                        max_len=max_len,
-                        repetition_penalty=repetition_penalty,
-                    )
+                    # 混合设备：T2S 可能被配置在跟 self.configs.device 不同的设备上，
+                    # 喂给它的输入要先搬过去；infer_panel_batch_infer 内部按输入
+                    # 张量的设备走，不用改模型代码。输出 pred_semantic_list 之后会在下面
+                    # 拼接给 VITS 时统一 .to(self.configs.device)，不用在这里搬回来。
+                    t2s_device = self.configs.t2s_device
+                    if self.t2s_mlx is not None and prompt is not None:
+                        # MLX：MLX 引擎逐句解码（bsz=1）。返回的是「新生成的 token」（不含 prompt），
+                        # idx = 生成数，所以下面统一的 item[-idx:] 切片拿到的就是整段，与 torch 路径语义一致。
+                        pred_semantic_list, idx_list = [], []
+                        for _i in range(len(all_phoneme_ids)):
+                            _tok, _n, _st = self.t2s_mlx.infer(
+                                all_phoneme_ids[_i],
+                                all_bert_features[_i],
+                                prompt[_i : _i + 1],
+                                top_k=top_k,
+                                top_p=top_p,
+                                temperature=temperature,
+                                repetition_penalty=repetition_penalty,
+                                early_stop_num=self.configs.hz * self.configs.max_sec,
+                            )
+                            print(f"T2S(MLX) [{prompt.shape[1]} -> +{_n}] {_st['tok_per_s']:.0f} tok/s, stop={_st['stop']}")
+                            pred_semantic_list.append(_tok.to(self.configs.device))
+                            idx_list.append(_n)
+                        t2s_device = self.configs.device
+                    else:
+                        pred_semantic_list, idx_list = self.t2s_model.model.infer_panel(
+                            [p.to(t2s_device) for p in all_phoneme_ids],
+                            all_phoneme_lens.to(t2s_device),
+                            prompt.to(t2s_device) if prompt is not None else None,
+                            [b.to(t2s_device) for b in all_bert_features],
+                            # prompt_phone_len=ph_offset,
+                            top_k=top_k,
+                            top_p=top_p,
+                            temperature=temperature,
+                            early_stop_num=self.configs.hz * self.configs.max_sec,
+                            max_len=max_len,
+                            repetition_penalty=repetition_penalty,
+                        )
                     t4 = time.perf_counter()
                     t_34 += t4 - t3
 
+                    # 混合设备：T2S 输出可能在 t2s_device 上，一次性搬回 self.configs.device——
+                    # 下面几条 VITS 消费路径（并行/串行、vocoder批量/vocoder串行）各自都会用到
+                    # pred_semantic_list，在源头转一次，比在每个消费点各自补 .to() 更不容易漏
+                    if t2s_device != self.configs.device:
+                        pred_semantic_list = [p.to(self.configs.device) for p in pred_semantic_list]
 
                     batch_audio_fragment = []
 
@@ -1336,7 +1427,8 @@ class TTS:
                         if parallel_infer:
                             print(f"{i18n('并行合成中')}...")
                             audio_fragments = self.using_vocoder_synthesis_batched_infer(
-                                idx_list, pred_semantic_list, batch_phones, speed=speed_factor, sample_steps=sample_steps
+                                idx_list, pred_semantic_list, batch_phones, speed=speed_factor,
+                                sample_steps=sample_steps, cfg_rate=cfg_rate,
                             )
                             batch_audio_fragment.extend(audio_fragments)
                         else:
@@ -1346,7 +1438,8 @@ class TTS:
                                     pred_semantic_list[i][-idx:].unsqueeze(0).unsqueeze(0)
                                 )  # .unsqueeze(0)#mq要多unsqueeze一次
                                 audio_fragment = self.using_vocoder_synthesis(
-                                    _pred_semantic, phones, speed=speed_factor, sample_steps=sample_steps
+                                    _pred_semantic, phones, speed=speed_factor,
+                                    sample_steps=sample_steps, cfg_rate=cfg_rate,
                                 )
                                 batch_audio_fragment.append(audio_fragment)
 
@@ -1355,11 +1448,14 @@ class TTS:
                     #     item.to(dtype=self.precision, device=self.configs.device)
                     #     for item in self.prompt_cache["refer_spec"]
                     # ]
+                    # 混合设备：同上，把 T2S 输入搬到 t2s_device（naive/streaming 路径，
+                    # 这条路径需与 batch_infer 一并覆盖）
+                    t2s_device = self.configs.t2s_device
                     semantic_token_generator =self.t2s_model.model.infer_panel(
-                        all_phoneme_ids[0].unsqueeze(0),
-                        all_phoneme_lens,
-                        prompt,
-                        all_bert_features[0].unsqueeze(0),
+                        all_phoneme_ids[0].unsqueeze(0).to(t2s_device),
+                        all_phoneme_lens.to(t2s_device),
+                        prompt.to(t2s_device) if prompt is not None else None,
+                        all_bert_features[0].unsqueeze(0).to(t2s_device),
                         top_k=top_k,
                         top_p=top_p,
                         temperature=temperature,
@@ -1394,6 +1490,10 @@ class TTS:
                     overlap_len = overlap_length
                     overlap_size = math.ceil(overlap_length*upsample_rate)
                     for semantic_tokens, is_final in semantic_token_generator:
+                        # 混合设备：generator 是在 t2s_device 上跑的，token 出来就搬回
+                        # self.configs.device——下面 decode_streaming 等 VITS 调用都不用再改
+                        if semantic_tokens is not None and t2s_device != self.configs.device:
+                            semantic_tokens = semantic_tokens.to(self.configs.device)
                         if semantic_tokens is None and last_audio_chunk is not None:
                             yield self.audio_postprocess(
                                     [[last_audio_chunk[-overlap_size:]]],
@@ -1597,8 +1697,11 @@ class TTS:
         return sr, audio
 
     def using_vocoder_synthesis(
-        self, semantic_tokens: torch.Tensor, phones: torch.Tensor, speed: float = 1.0, sample_steps: int = 32
+        self, semantic_tokens: torch.Tensor, phones: torch.Tensor, speed: float = 1.0,
+        sample_steps: int = None, cfg_rate: float = None,
     ):
+        sample_steps = (4 if self.configs.version == "v5turbo" else 32) if sample_steps is None else int(sample_steps)
+        cfg_rate = (1.30 if self.configs.version == "v5dev" else 0.0) if cfg_rate is None else float(cfg_rate)
         prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
         prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
         raw_entry = self.prompt_cache["refer_spec"][0]
@@ -1620,6 +1723,14 @@ class TTS:
 
         mel2 = mel_fn(ref_audio) if self.configs.version == "v3" else mel_fn_v4(ref_audio)
         mel2 = norm_spec(mel2)
+        if self.configs.version in V5_VERSIONS:
+            # V5：CFM 的参考/滚动分块逻辑在 models_v5.synthesize_v5_mel 里（上游实现，原样搬）
+            fea_todo, _ = self.vits_model.decode_encp(semantic_tokens, phones, refer_audio_spec, ge, speed)
+            mel = synthesize_v5_mel(
+                self.vits_model, fea_ref, fea_todo, mel2.to(self.precision), sample_steps, cfg_rate,
+            )
+            with torch.inference_mode():
+                return self.vocoder(denorm_spec(mel).to(self.precision))[0, 0]
         T_min = min(mel2.shape[2], fea_ref.shape[2])
         mel2 = mel2[:, :, :T_min]
         fea_ref = fea_ref[:, :, :T_min]
@@ -1667,8 +1778,21 @@ class TTS:
         semantic_tokens_list: List[torch.Tensor],
         batch_phones: List[torch.Tensor],
         speed: float = 1.0,
-        sample_steps: int = 32,
+        sample_steps: int = None,
+        cfg_rate: float = None,
     ) -> List[torch.Tensor]:
+        sample_steps = (4 if self.configs.version == "v5turbo" else 32) if sample_steps is None else int(sample_steps)
+        cfg_rate = (1.30 if self.configs.version == "v5dev" else 0.0) if cfg_rate is None else float(cfg_rate)
+        if self.configs.version in V5_VERSIONS:
+            # V5 没有批量 CFM 路径，逐句走 using_vocoder_synthesis（同上游）
+            return [
+                self.using_vocoder_synthesis(
+                    semantic_tokens_list[i][-idx:].unsqueeze(0).unsqueeze(0),
+                    batch_phones[i].unsqueeze(0).to(self.configs.device),
+                    speed=speed, sample_steps=sample_steps, cfg_rate=cfg_rate,
+                )
+                for i, idx in enumerate(idx_list)
+            ]
         prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
         prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
         raw_entry = self.prompt_cache["refer_spec"][0]

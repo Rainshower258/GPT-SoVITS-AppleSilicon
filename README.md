@@ -1,482 +1,140 @@
+# GPT-SoVITS · Apple Silicon 加速（MPS / MLX）
+
 <div align="center">
 
-<h1>GPT-SoVITS-WebUI</h1>
-A Powerful Few-shot Voice Conversion and Text-to-Speech WebUI.<br><br>
-
-[![madewithlove](https://img.shields.io/badge/made_with-%E2%9D%A4-red?style=for-the-badge&labelColor=orange)](https://github.com/RVC-Boss/GPT-SoVITS)
-
-<a href="https://trendshift.io/repositories/7033" target="_blank"><img src="https://trendshift.io/api/badge/repositories/7033" alt="RVC-Boss%2FGPT-SoVITS | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-
-<!-- img src="https://counter.seku.su/cmoe?name=gptsovits&theme=r34" /><br> -->
-
-[![Python](https://img.shields.io/badge/python-3.10--3.12-blue?style=for-the-badge&logo=python)](https://www.python.org)
-[![GitHub release](https://img.shields.io/github/v/release/RVC-Boss/gpt-sovits?style=for-the-badge&logo=github)](https://github.com/RVC-Boss/gpt-sovits/releases)
-
-[![Train In Colab](https://img.shields.io/badge/Colab-Training-F9AB00?style=for-the-badge&logo=googlecolab)](https://colab.research.google.com/github/RVC-Boss/GPT-SoVITS/blob/main/Colab-WebUI.ipynb)
-[![Huggingface](https://img.shields.io/badge/免费在线体验-free_online_demo-yellow.svg?style=for-the-badge&logo=huggingface)](https://lj1995-gpt-sovits-proplus.hf.space/)
-[![Image Size](https://img.shields.io/docker/image-size/xxxxrt666/gpt-sovits/latest?style=for-the-badge&logo=docker)](https://hub.docker.com/r/xxxxrt666/gpt-sovits)
-
-[![简体中文](https://img.shields.io/badge/简体中文-阅读文档-blue?style=for-the-badge&logo=googledocs&logoColor=white)](https://www.yuque.com/baicaigongchang1145haoyuangong/ib3g1e)
-[![English](https://img.shields.io/badge/English-Read%20Docs-blue?style=for-the-badge&logo=googledocs&logoColor=white)](https://rentry.co/GPT-SoVITS-guide#/)
-[![Change Log](https://img.shields.io/badge/Change%20Log-View%20Updates-blue?style=for-the-badge&logo=googledocs&logoColor=white)](https://github.com/RVC-Boss/GPT-SoVITS/blob/main/docs/en/Changelog_EN.md)
-[![License](https://img.shields.io/badge/LICENSE-MIT-green.svg?style=for-the-badge&logo=opensourceinitiative)](https://github.com/RVC-Boss/GPT-SoVITS/blob/main/LICENSE)
-
-**English** | [**中文简体**](./docs/cn/README.md) | [**日本語**](./docs/ja/README.md) | [**한국어**](./docs/ko/README.md) | [**Türkçe**](./docs/tr/README.md)
+**中文简体** | [**English**](./README.en.md)
 
 </div>
 
----
+> 本项目 fork 自 [RVC-Boss/GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS)（基于 `main` 分支提交 `48b1a01`），为非官方版本，与上游项目无隶属关系。上游原版说明见 [README_UPSTREAM.md](./README_UPSTREAM.md)。
 
-## Features:
+## 关于本项目
 
-1. **Zero-shot TTS:** Input a 5-second vocal sample and experience instant text-to-speech conversion.
+上游版本在 macOS 上仅使用 CPU 推理。本项目为 Mac 启用 GPU 推理：
 
-2. **Few-shot TTS:** Fine-tune the model with just 1 minute of training data for improved voice similarity and realism.
+- 启用 MPS，并修复 T2S 解码中 KV cache 每一步都通过 `torch.cat` 重新分配的问题。该问题会导致解码速度随句子变长而持续下降、显存占用不断增加。
+- 将 T2S 解码迁移至 Apple 的 MLX 框架执行。
 
-3. **Cross-lingual Support:** Inference in languages different from the training dataset, currently supporting English, Japanese, Korean, Cantonese and Chinese.
+在上游自带的推理页面中执行相同操作，速度提升约 3 至 4 倍，合成质量不变。
 
-4. **WebUI Tools:** Integrated tools include voice accompaniment separation, automatic training set segmentation, multilingual ASR with [Fun-ASR-Nano](https://github.com/FunAudioLLM/Fun-ASR), [SenseVoice](https://github.com/FunAudioLLM/SenseVoice), and classic [FunASR](https://github.com/modelscope/FunASR), plus text labeling, assisting beginners in creating training datasets and GPT/SoVITS models.
+## 改动
 
-**Check out our [demo video](https://www.bilibili.com/video/BV12g4y1m7Uw) here!**
+| 类别 | 改动 |
+|---|---|
+| 设备识别 | 推理时识别并使用 MPS（`config.py`、`TTS_Config`、推理页）；训练设备选择不包含 MPS |
+| KV cache | T2S 解码的 KV cache 改为预分配的静态缓冲区，不再逐步拼接。长文本的显存占用由 25.5 GB 降至 4.9 GB |
+| 注意力掩码 | 无填充时，解码步不再构造 attention mask |
+| 流式合成 | 流式合成路径同样采用静态 KV cache |
+| STFT | `torch.stft` 改用 `return_complex=True`，替换即将移除的旧接口 |
+| 混合设备 | 新增 `t2s_device` 配置项，T2S 与 VITS 可分别运行在不同设备上 |
+| MLX 推理 | 新增 `GPT_SoVITS/Accel/mlx_t2s.py`，使用 MLX 执行 T2S 解码，支持 fp16 与 int8 |
+| MLX 编译 | 对解码步进行局部编译（`mx.compile`），进一步缩短 int8 模式下的解码耗时 |
+| V5 支持 | 移植 v5dev / v5turbo 的模型代码、配置与推理页支持 |
 
-Unseen speakers few-shot fine-tuning demo:
+MLX 模型层与 V5 支持移植自上游的 `cuda_graph_accel_v5` 分支。该分支的 MLX 代码无法直接在 macOS 上运行，本项目修复了以下问题：
 
-https://github.com/RVC-Boss/GPT-SoVITS/assets/129054828/05bee1fa-bdd8-4d85-9350-80c060ab47fb
+- MLX 的默认设备按线程设置，后台线程需单独指定；
+- Transformer 层调用 attention 时参数顺序不匹配；
+- 依赖仅 CUDA 环境才有的属性；
+- MXFP8 量化的位数设置错误。
 
-**RTF(inference speed) of GPT-SoVITS v2 ProPlus**:
-0.028 tested in 4060Ti, 0.014 tested in 4090 (1400words~=4min, inference time is 3.36s), 0.526 in M4 CPU. You can test our [huggingface demo](https://lj1995-gpt-sovits-proplus.hf.space/) (half H200) to experience high-speed inference .
+上游调度层另有若干张量维度与采样逻辑问题。本项目未直接修补，而是参照 PyTorch 版本的解码逻辑重新实现了单请求解码循环，仅复用上游的模型层。
 
-请不要尬黑GPT-SoVITS推理速度慢，谢谢！
+## 速度
 
-CPU-Optimized Inference Version：https://github.com/baicai-1145/GPT-SoVITS-CPUFast
+测试环境：Apple M5，24 GB 内存，macOS 26.3，PyTorch 2.11，MLX 0.32。
 
-**User guide: [简体中文](https://www.yuque.com/baicaigongchang1145haoyuangong/ib3g1e) | [English](https://rentry.co/GPT-SoVITS-guide#/)**
+测试方法：分别启动各版本代码的快速推理页（`inference_webui_fast.py`），通过其 `/inference` 接口合成。参考音频、随机种子与模型（v2ProPlus）均相同，结果取中位数。
 
-## Installation
+| 版本 | 短文本（67 字，按标点切分） | RTF | 长文本（223 字，不切分） | RTF |
+|---|---|---|---|---|
+| 上游原版（CPU） | 7.50 秒 | 0.400 | 26.8 秒 | 0.494 |
+| 本项目，未启用 MLX | 3.95 秒 | 0.228 | 13.8 秒 | 0.254 |
+| **本项目，启用 MLX（int8 + 局部编译）** | **2.13 秒** | **0.131** | **6.30 秒** | **0.117** |
 
-For users in China, you can [click here](https://www.codewithgpu.com/i/RVC-Boss/GPT-SoVITS/GPT-SoVITS-Official) to use AutoDL Cloud Docker to experience the full functionality online.
+RTF 为合成耗时与音频时长之比，数值越小速度越快。
 
-### Tested Environments
+按 RTF 计算，相对上游原版，短文本提速 3.1 倍，长文本提速 4.2 倍（各次合成的音频时长因随机采样略有不同，故以 RTF 而非耗时计算倍数）。以长文本为例，T2S 阶段由 15.4 秒降至 3.4 秒，VITS 阶段由 10.5 秒降至 1.27 秒。
 
-| Python Version | PyTorch Version  | Device        |
-| -------------- | ---------------- | ------------- |
-| Python 3.10    | PyTorch 2.5.1    | CUDA 12.4     |
-| Python 3.11    | PyTorch 2.5.1    | CUDA 12.4     |
-| Python 3.11    | PyTorch 2.7.0    | CUDA 12.8     |
-| Python 3.9     | PyTorch 2.8.0dev | CUDA 12.8     |
-| Python 3.9     | PyTorch 2.5.1    | Apple silicon |
-| Python 3.11    | PyTorch 2.7.0    | Apple silicon |
-| Python 3.9     | PyTorch 2.2.2    | CPU           |
+前两行在同一轮测试中依次测得，各运行 3 次。启用 MLX 一行在设备空闲、充分降温后单独测得，运行 5 次。"未启用 MLX"一行测于引入 MLX 之前的提交，与当前版本设置 `t2s_backend: torch` 时的代码路径相同。
 
-### Windows
+## 质量
 
-If you are a Windows user (tested with win>=10), you can [download the integrated package](https://huggingface.co/lj1995/GPT-SoVITS-windows-package/resolve/main/GPT-SoVITS-v3lora-20250228.7z?download=true) and double-click on _go-webui.bat_ to start GPT-SoVITS-WebUI.
+本项目只改变计算方式，不修改模型，合成音质与上游一致。
 
-**Users in China can [download the package here](https://www.yuque.com/baicaigongchang1145haoyuangong/ib3g1e/dkxgpiy9zb96hob4#KTvnO).**
+- **未启用 MLX 时**：使用相同的随机种子，生成的语音内容与上游完全相同。
+- **启用 MLX 时**：由于计算方式不同，同一句话的停顿和语调会有自然的细微差异，程度与上游更换随机种子时相当。在多种音色、数百句文本的语音识别测试中，读错的比例与上游持平；试听未发现杂音、吞字或音色变化。
+- **精度选择**：int8 与 fp16 在听感上没有可察觉的差别，int8 速度更快，推荐使用。不建议使用 MXFP8，其输出与原版的偏差较为明显。
 
-Install the program by running the following commands:
+## 安装与使用
 
-```pwsh
-conda create -n GPTSoVits python=3.10
-conda activate GPTSoVits
-pwsh -F install.ps1 --Device <CU126|CU128|CPU> --Source <HF|HF-Mirror|ModelScope> [--DownloadUVR5]
-```
-
-### Linux
-
-```bash
-conda create -n GPTSoVits python=3.10
-conda activate GPTSoVits
-bash install.sh --device <CU126|CU128|ROCM|CPU> --source <HF|HF-Mirror|ModelScope> [--download-uvr5]
-```
-
-### macOS
-
-**Note: The models trained with GPUs on Macs result in significantly lower quality compared to those trained on other devices, so we are temporarily using CPUs instead.**
-
-Install the program by running the following commands:
+按上游方式安装，设备选择 MPS：
 
 ```bash
-conda create -n GPTSoVits python=3.10
-conda activate GPTSoVits
-bash install.sh --device <MPS|CPU> --source <HF|HF-Mirror|ModelScope> [--download-uvr5]
+bash install.sh --device MPS --source HF
+pip install mlx
 ```
 
-### Install Manually
+> 注：上游的 `--device MPS` 选项实际安装的是仅支持 CPU 的 PyTorch；本项目改为安装标准版本，该版本在 macOS 上自带 MPS 支持。
+>
+> 本仓库不包含预训练模型，请按上游说明另行下载。
 
-#### Install Dependences
+在 `GPT_SoVITS/configs/tts_infer.yaml` 的 `custom` 段中设置：
 
-```bash
-conda create -n GPTSoVits python=3.10
-conda activate GPTSoVits
-
-pip install -r extra-req.txt --no-deps
-pip install -r requirements.txt
+```yaml
+custom:
+  version: v2ProPlus
+  device: mps
+  t2s_device: cpu          # 仅影响流式合成
+  t2s_backend: mlx         # torch 或 mlx
+  t2s_mlx_dtype: float16
+  t2s_mlx_quant: Affine    # 留空为 fp16；Affine 为 int8
+  t2s_mlx_compile: true
+  is_half: false
+  t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
+  vits_weights_path: GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth
+  bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+  cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
 ```
 
-#### Install FFmpeg
+可选择以下任一方式启动：
 
-##### Conda Users
+- **API 服务**：运行 `./start_api.sh`，监听 `127.0.0.1:9880`，接口与上游 `api_v2.py` 一致。
+- **网页界面**：运行 `python webui.py`，在推理标签页勾选"启用并行推理版本"后打开推理页。
 
-```bash
-conda activate GPTSoVits
-conda install ffmpeg
-```
+所有新增配置项均有默认值；未设置时，行为与上游一致。
 
-##### Ubuntu/Debian Users
+## 已知限制
 
-```bash
-sudo apt install ffmpeg
-sudo apt install libsox-dev
-```
+- 目前仅在 Apple M5 上完成测试。其他 Apple Silicon 芯片预期可用，尚未验证。
+- MLX 引擎仅用于非流式合成；流式合成仍使用 PyTorch 实现。
+- 未填写参考文本时（无参考文本模式），自动改用 PyTorch 实现。
+- 旧版推理页（未勾选"启用并行推理版本"时打开的页面）使用独立的推理代码，仅包含设备识别与 KV cache 相关改动，**无法使用 MLX**。建议使用快速推理页或 API。
+- v3 / v4 模型的 VITS 阶段（32 步 CFM）在 MPS 上耗时较长，一句 20 秒的音频需 60 秒以上，本项目暂未优化。
+- V5 turbo 可以运行，但 VITS 阶段耗时约为 v2ProPlus 的 7 倍，且偶有轻微电子音，因此未设为默认。
+- 未移植上游的 Windows 便携包初始化代码及 CUDA Graph、FlashAttention 开关，推理页上的相关选项在本项目中不生效。
+- `webui.py` 启动推理页时不再使用 `python -s` 参数，以避免部分分层安装的虚拟环境找不到依赖包。常规环境不受影响。
+- 训练流程未作修改，仍不支持使用 MPS 训练。
 
-##### Windows Users
+## 基准测试脚本
 
-Download and place [ffmpeg.exe](https://huggingface.co/lj1995/VoiceConversionWebUI/blob/main/ffmpeg.exe) and [ffprobe.exe](https://huggingface.co/lj1995/VoiceConversionWebUI/blob/main/ffprobe.exe) in the GPT-SoVITS root
+测试所用的基准与验证脚本位于 `bench_mps/` 目录：
 
-Install [Visual Studio 2017](https://aka.ms/vs/17/release/vc_redist.x86.exe)
+| 脚本 | 用途 |
+|---|---|
+| `e2e_baseline.py` | 端到端合成基准，可切换设备与 MLX 选项 |
+| `p6_webui_compare.py` | 通过推理页接口进行速度对比 |
+| `p6_verify_mlx_logits.py` | 逐步比对 MLX 与 PyTorch 的输出 |
+| `verify_static_cache.py` | 验证静态 KV cache 与原实现的数值一致性 |
 
-##### MacOS Users
+## 致谢
 
-```bash
-brew install ffmpeg
-```
+- [RVC-Boss/GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) 及其全部贡献者。
+- [@XXXXRT666](https://github.com/XXXXRT666)：`GPT_SoVITS/Accel/MLX` 模型层原作者。
+- Apple [MLX](https://github.com/ml-explore/mlx) 团队。
 
-### Running GPT-SoVITS with Docker
+## 许可与声明
 
-#### Docker Image Selection
+本仓库以 MIT 许可发布，上游原 `LICENSE` 原样保留。使用本项目合成任何内容时，请遵守上游 README 中的使用声明，使用者对合成内容自行负责。
 
-Due to rapid development in the codebase and a slower Docker image release cycle, please:
-
-- Check [Docker Hub](https://hub.docker.com/r/xxxxrt666/gpt-sovits) for the latest available image tags
-- Choose an appropriate image tag for your environment
-- `Lite` means the Docker image **does not include** ASR models and UVR5 models. You can manually download the UVR5 models, while the program will automatically download the ASR models as needed
-- The appropriate architecture image (amd64/arm64) will be automatically pulled during Docker Compose
-- Docker Compose will mount **all files** in the current directory. Please switch to the project root directory and **pull the latest code** before using the Docker image
-- Optionally, build the image locally using the provided Dockerfile for the most up-to-date changes
-
-#### Environment Variables
-
-- `is_half`: Controls whether half-precision (fp16) is enabled. Set to `true` if your GPU supports it to reduce memory usage.
-
-#### Shared Memory Configuration
-
-On Windows (Docker Desktop), the default shared memory size is small and may cause unexpected behavior. Increase `shm_size` (e.g., to `16g`) in your Docker Compose file based on your available system memory.
-
-#### Choosing a Service
-
-The `docker-compose.yaml` defines two services:
-
-- `GPT-SoVITS-CU126` & `GPT-SoVITS-CU128`: Full version with all features.
-- `GPT-SoVITS-CU126-Lite` & `GPT-SoVITS-CU128-Lite`: Lightweight version with reduced dependencies and functionality.
-
-To run a specific service with Docker Compose, use:
-
-```bash
-docker compose run --service-ports <GPT-SoVITS-CU126-Lite|GPT-SoVITS-CU128-Lite|GPT-SoVITS-CU126|GPT-SoVITS-CU128>
-```
-
-#### Building the Docker Image Locally
-
-If you want to build the image yourself, use:
-
-```bash
-bash docker_build.sh --cuda <12.6|12.8> [--lite]
-```
-
-#### Accessing the Running Container (Bash Shell)
-
-Once the container is running in the background, you can access it using:
-
-```bash
-docker exec -it <GPT-SoVITS-CU126-Lite|GPT-SoVITS-CU128-Lite|GPT-SoVITS-CU126|GPT-SoVITS-CU128> bash
-```
-
-## Pretrained Models
-
-**If `install.sh` runs successfully, you may skip No.1,2,3**
-
-**Users in China can [download all these models here](https://www.yuque.com/baicaigongchang1145haoyuangong/ib3g1e/dkxgpiy9zb96hob4#nVNhX).**
-
-1. Download pretrained models from [GPT-SoVITS Models](https://huggingface.co/lj1995/GPT-SoVITS) and place them in `GPT_SoVITS/pretrained_models`.
-
-2. Download G2PW models from [G2PWModel.zip(HF)](https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/G2PWModel.zip)| [G2PWModel.zip(ModelScope)](https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/G2PWModel.zip), unzip and rename to `G2PWModel`, and then place them in `GPT_SoVITS/text`.(Chinese TTS Only)
-
-3. For UVR5 (Vocals/Accompaniment Separation & Reverberation Removal, additionally), download models from [UVR5 Weights](https://huggingface.co/lj1995/VoiceConversionWebUI/tree/main/uvr5_weights) and place them in `tools/uvr5/uvr5_weights`.
-
-   - If you want to use `bs_roformer` or `mel_band_roformer` models for UVR5, you can manually download the model and corresponding configuration file, and put them in `tools/uvr5/uvr5_weights`. **Rename the model file and configuration file, ensure that the model and configuration files have the same and corresponding names except for the suffix**. In addition, the model and configuration file names **must include `roformer`** in order to be recognized as models of the roformer class.
-
-   - The suggestion is to **directly specify the model type** in the model name and configuration file name, such as `mel_mand_roformer`, `bs_roformer`. If not specified, the features will be compared from the configuration file to determine which type of model it is. For example, the model `bs_roformer_ep_368_sdr_12.9628.ckpt` and its corresponding configuration file `bs_roformer_ep_368_sdr_12.9628.yaml` are a pair, `kim_mel_band_roformer.ckpt` and `kim_mel_band_roformer.yaml` are also a pair.
-
-4. FunASR models are downloaded automatically on first use. The WebUI offers [Fun-ASR-Nano](https://github.com/FunAudioLLM/Fun-ASR) for multilingual and dialect ASR, [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) for fast transcription, and classic Paraformer/UniASR through [FunASR](https://github.com/modelscope/FunASR) for Chinese and Cantonese. To preinstall the classic Chinese models for offline use, download the [ASR model](https://modelscope.cn/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch/files), [VAD model](https://modelscope.cn/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch/files), and [punctuation model](https://modelscope.cn/models/iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch/files) into `tools/asr/models`.
-
-5. For English or Japanese ASR (additionally), download models from [Faster Whisper Large V3](https://huggingface.co/Systran/faster-whisper-large-v3) and place them in `tools/asr/models`. Also, [other models](https://huggingface.co/Systran) may have the similar effect with smaller disk footprint.
-
-## Dataset Format
-
-The TTS annotation .list file format:
-
-```
-
-vocal_path|speaker_name|language|text
-
-```
-
-Language dictionary:
-
-- 'zh': Chinese
-- 'ja': Japanese
-- 'en': English
-- 'ko': Korean
-- 'yue': Cantonese
-
-Example:
-
-```
-
-D:\GPT-SoVITS\xxx/xxx.wav|xxx|en|I like playing Genshin.
-
-```
-
-## Finetune and inference
-
-### Open WebUI
-
-#### Integrated Package Users
-
-Double-click `go-webui.bat`or use `go-webui.ps1`
-if you want to switch to V1,then double-click`go-webui-v1.bat` or use `go-webui-v1.ps1`
-
-#### Others
-
-```bash
-python webui.py <language(optional)>
-```
-
-if you want to switch to V1,then
-
-```bash
-python webui.py v1 <language(optional)>
-```
-
-Or maunally switch version in WebUI
-
-### Finetune
-
-#### Path Auto-filling is now supported
-
-1. Fill in the audio path
-2. Slice the audio into small chunks
-3. Denoise(optinal)
-4. ASR
-5. Proofreading ASR transcriptions
-6. Go to the next Tab, then finetune the model
-
-### Open Inference WebUI
-
-#### Integrated Package Users
-
-Double-click `go-webui-v2.bat` or use `go-webui-v2.ps1` ,then open the inference webui at `1-GPT-SoVITS-TTS/1C-inference`
-
-#### Others
-
-```bash
-python GPT_SoVITS/inference_webui.py <language(optional)>
-```
-
-OR
-
-```bash
-python webui.py
-```
-
-then open the inference webui at `1-GPT-SoVITS-TTS/1C-inference`
-
-## V2 Release Notes
-
-New Features:
-
-1. Support Korean and Cantonese
-
-2. An optimized text frontend
-
-3. Pre-trained model extended from 2k hours to 5k hours
-
-4. Improved synthesis quality for low-quality reference audio
-
-   [more details](<https://github.com/RVC-Boss/GPT-SoVITS/wiki/GPT%E2%80%90SoVITS%E2%80%90v2%E2%80%90features-(%E6%96%B0%E7%89%B9%E6%80%A7)>)
-
-Use v2 from v1 environment:
-
-1. `pip install -r requirements.txt` to update some packages
-
-2. Clone the latest codes from github.
-
-3. Download v2 pretrained models from [huggingface](https://huggingface.co/lj1995/GPT-SoVITS/tree/main/gsv-v2final-pretrained) and put them into `GPT_SoVITS/pretrained_models/gsv-v2final-pretrained`.
-
-   Chinese v2 additional: [G2PWModel.zip(HF)](https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/G2PWModel.zip)| [G2PWModel.zip(ModelScope)](https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/G2PWModel.zip)(Download G2PW models, unzip and rename to `G2PWModel`, and then place them in `GPT_SoVITS/text`.)
-
-## V3 Release Notes
-
-New Features:
-
-1. The timbre similarity is higher, requiring less training data to approximate the target speaker (the timbre similarity is significantly improved using the base model directly without fine-tuning).
-
-2. GPT model is more stable, with fewer repetitions and omissions, and it is easier to generate speech with richer emotional expression.
-
-   [more details](<https://github.com/RVC-Boss/GPT-SoVITS/wiki/GPT%E2%80%90SoVITS%E2%80%90v3v4%E2%80%90features-(%E6%96%B0%E7%89%B9%E6%80%A7)>)
-
-Use v3 from v2 environment:
-
-1. `pip install -r requirements.txt` to update some packages
-
-2. Clone the latest codes from github.
-
-3. Download v3 pretrained models (s1v3.ckpt, s2Gv3.pth and models--nvidia--bigvgan_v2_24khz_100band_256x folder) from [huggingface](https://huggingface.co/lj1995/GPT-SoVITS/tree/main) and put them into `GPT_SoVITS/pretrained_models`.
-
-   additional: for Audio Super Resolution model, you can read [how to download](./tools/AP_BWE_main/24kto48k/readme.txt)
-
-## V4 Release Notes
-
-New Features:
-
-1. Version 4 fixes the issue of metallic artifacts in Version 3 caused by non-integer multiple upsampling, and natively outputs 48k audio to prevent muffled sound (whereas Version 3 only natively outputs 24k audio). The author considers Version 4 a direct replacement for Version 3, though further testing is still needed.
-   [more details](<https://github.com/RVC-Boss/GPT-SoVITS/wiki/GPT%E2%80%90SoVITS%E2%80%90v3v4%E2%80%90features-(%E6%96%B0%E7%89%B9%E6%80%A7)>)
-
-Use v4 from v1/v2/v3 environment:
-
-1. `pip install -r requirements.txt` to update some packages
-
-2. Clone the latest codes from github.
-
-3. Download v4 pretrained models (gsv-v4-pretrained/s2v4.pth, and gsv-v4-pretrained/vocoder.pth) from [huggingface](https://huggingface.co/lj1995/GPT-SoVITS/tree/main) and put them into `GPT_SoVITS/pretrained_models`.
-
-## V2Pro Release Notes
-
-New Features:
-
-1. Slightly higher VRAM usage than v2, surpassing v4's performance, with v2's hardware cost and speed.
-   [more details](<https://github.com/RVC-Boss/GPT-SoVITS/wiki/GPT%E2%80%90SoVITS%E2%80%90features-(%E5%90%84%E7%89%88%E6%9C%AC%E7%89%B9%E6%80%A7)>)
-
-2.v1/v2 and the v2Pro series share the same characteristics, while v3/v4 have similar features. For training sets with average audio quality, v1/v2/v2Pro can deliver decent results, but v3/v4 cannot. Additionally, the synthesized tone and timebre of v3/v4 lean more toward the reference audio rather than the overall training set.
-
-Use v2Pro from v1/v2/v3/v4 environment:
-
-1. `pip install -r requirements.txt` to update some packages
-
-2. Clone the latest codes from github.
-
-3. Download v2Pro pretrained models (v2Pro/s2Dv2Pro.pth, v2Pro/s2Gv2Pro.pth, v2Pro/s2Dv2ProPlus.pth, v2Pro/s2Gv2ProPlus.pth, and sv/pretrained_eres2netv2w24s4ep4.ckpt) from [huggingface](https://huggingface.co/lj1995/GPT-SoVITS/tree/main) and put them into `GPT_SoVITS/pretrained_models`.
-
-## Todo List
-
-- [x] **High Priority:**
-
-  - [x] Localization in Japanese and English.
-  - [x] User guide.
-  - [x] Japanese and English dataset fine tune training.
-
-- [ ] **Features:**
-  - [x] Zero-shot voice conversion (5s) / few-shot voice conversion (1min).
-  - [x] TTS speaking speed control.
-  - [ ] ~~Enhanced TTS emotion control.~~ Maybe use pretrained finetuned preset GPT models for better emotion.
-  - [ ] Experiment with changing SoVITS token inputs to probability distribution of GPT vocabs (transformer latent).
-  - [x] Improve English and Japanese text frontend.
-  - [ ] Develop tiny and larger-sized TTS models.
-  - [x] Colab scripts.
-  - [x] Try expand training dataset (2k hours -> 10k hours).
-  - [x] better sovits base model (enhanced audio quality)
-  - [ ] model mix
-
-## (Additional) Method for running from the command line
-
-Use the command line to open the WebUI for UVR5
-
-```bash
-python tools/uvr5/webui.py "<infer_device>" <is_half> <webui_port_uvr5>
-```
-
-<!-- If you can't open a browser, follow the format below for UVR processing,This is using mdxnet for audio processing
-```
-python mdxnet.py --model --input_root --output_vocal --output_ins --agg_level --format --device --is_half_precision
-``` -->
-
-This is how the audio segmentation of the dataset is done using the command line
-
-```bash
-python audio_slicer.py \
-    --input_path "<path_to_original_audio_file_or_directory>" \
-    --output_root "<directory_where_subdivided_audio_clips_will_be_saved>" \
-    --threshold <volume_threshold> \
-    --min_length <minimum_duration_of_each_subclip> \
-    --min_interval <shortest_time_gap_between_adjacent_subclips>
-    --hop_size <step_size_for_computing_volume_curve>
-```
-
-Run dataset ASR with FunASR from the command line. Fun-ASR-Nano is the default for Chinese, English, Japanese, Korean, and automatic language detection; Cantonese keeps the classic FunASR backend.
-
-```bash
-python tools/asr/funasr_asr.py -i <input> -o <output> -l zh
-```
-
-Faster Whisper is also available as an ASR backend.
-
-(No progress bars, GPU performance may cause time delays)
-
-```bash
-python ./tools/asr/fasterwhisper_asr.py -i <input> -o <output> -l <language> -p <precision>
-```
-
-A custom list save path is enabled
-
-## Credits
-
-Special thanks to the following projects and contributors:
-
-### Theoretical Research
-
-- [ar-vits](https://github.com/innnky/ar-vits)
-- [SoundStorm](https://github.com/yangdongchao/SoundStorm/tree/master/soundstorm/s1/AR)
-- [vits](https://github.com/jaywalnut310/vits)
-- [TransferTTS](https://github.com/hcy71o/TransferTTS/blob/master/models.py#L556)
-- [contentvec](https://github.com/auspicious3000/contentvec/)
-- [hifi-gan](https://github.com/jik876/hifi-gan)
-- [fish-speech](https://github.com/fishaudio/fish-speech/blob/main/tools/llama/generate.py#L41)
-- [f5-TTS](https://github.com/SWivid/F5-TTS/blob/main/src/f5_tts/model/backbones/dit.py)
-- [shortcut flow matching](https://github.com/kvfrans/shortcut-models/blob/main/targets_shortcut.py)
-
-### Pretrained Models
-
-- [Chinese Speech Pretrain](https://github.com/TencentGameMate/chinese_speech_pretrain)
-- [Chinese-Roberta-WWM-Ext-Large](https://huggingface.co/hfl/chinese-roberta-wwm-ext-large)
-- [BigVGAN](https://github.com/NVIDIA/BigVGAN)
-- [eresnetv2](https://modelscope.cn/models/iic/speech_eres2netv2w24s4ep4_sv_zh-cn_16k-common)
-
-### Text Frontend for Inference
-
-- [paddlespeech zh_normalization](https://github.com/PaddlePaddle/PaddleSpeech/tree/develop/paddlespeech/t2s/frontend/zh_normalization)
-- [split-lang](https://github.com/DoodleBears/split-lang)
-- [g2pW](https://github.com/GitYCC/g2pW)
-- [pypinyin-g2pW](https://github.com/mozillazg/pypinyin-g2pW)
-- [paddlespeech g2pw](https://github.com/PaddlePaddle/PaddleSpeech/tree/develop/paddlespeech/t2s/frontend/g2pw)
-
-### WebUI Tools
-
-- [ultimatevocalremovergui](https://github.com/Anjok07/ultimatevocalremovergui)
-- [audio-slicer](https://github.com/openvpi/audio-slicer)
-- [SubFix](https://github.com/cronrpc/SubFix)
-- [FFmpeg](https://github.com/FFmpeg/FFmpeg)
-- [gradio](https://github.com/gradio-app/gradio)
-- [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-- [FunASR](https://github.com/modelscope/FunASR)
-- [Fun-ASR](https://github.com/FunAudioLLM/Fun-ASR)
-- [SenseVoice](https://github.com/FunAudioLLM/SenseVoice)
-- [AP-BWE](https://github.com/yxlu-0102/AP-BWE)
-
-Thankful to @Naozumi520 for providing the Cantonese training set and for the guidance on Cantonese-related knowledge.
-
-## Thanks to all contributors for their efforts
-
-<a href="https://github.com/RVC-Boss/GPT-SoVITS/graphs/contributors" target="_blank">
-  <img src="https://contrib.rocks/image?repo=RVC-Boss/GPT-SoVITS" />
-</a>
+<sub>问题反馈：devinwild48@gmail.com</sub>

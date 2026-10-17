@@ -1,6 +1,7 @@
 import os
 import sys
 
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # 必须在 import torch 之前设置；子进程会继承这个环境变量
 os.environ["version"] = version = "v2Pro"
 now_dir = os.getcwd()
 sys.path.insert(0, now_dir)
@@ -88,7 +89,6 @@ from tools.my_utils import check_details, check_for_existance
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1' # 当遇到mps不支持的步骤时使用cpu
 import gradio as gr
 
 n_cpu = cpu_count()
@@ -98,7 +98,7 @@ gpu_infos = GPU_INFOS
 mem = memset
 is_gpu_ok = IS_GPU
 
-v3v4set = {"v3", "v4"}
+v3v4set = {"v3", "v4", "v5dev", "v5turbo"}
 
 
 def set_default():
@@ -139,7 +139,8 @@ def set_default():
 set_default()
 
 gpus = "-".join(map(str, GPU_INDEX))
-default_gpu_numbers = infer_device.index
+# MPS 没有 CUDA 式的多卡编号，device.index 是 None，用 0 占位避免下游拿到字符串 "None"
+default_gpu_numbers = infer_device.index if infer_device.index is not None else 0
 
 
 def fix_gpu_number(input):  # 将越界的number强制改到界内
@@ -167,14 +168,15 @@ from config import pretrained_gpt_name, pretrained_sovits_name
 def check_pretrained_is_exist(version):
     pretrained_model_list = (
         pretrained_sovits_name[version],
-        pretrained_sovits_name[version].replace("s2G", "s2D"),
         pretrained_gpt_name[version],
         "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
         "GPT_SoVITS/pretrained_models/chinese-hubert-base",
     )
+    if version not in v3v4set:
+        pretrained_model_list += (pretrained_sovits_name[version].replace("s2G", "s2D"),)
     _ = ""
     for i in pretrained_model_list:
-        if "s2Dv3" not in i and "s2Dv4" not in i and os.path.exists(i) == False:
+        if os.path.exists(i) == False:
             _ += f"\n    {i}"
     if _:
         print("warning: ", i18n("以下模型不存在:") + _)
@@ -331,9 +333,11 @@ process_name_tts = i18n("TTS推理WebUI")
 def change_tts_inference(bert_path, cnhubert_base_path, gpu_number, gpt_path, sovits_path, batched_infer_enabled):
     global p_tts_inference
     if batched_infer_enabled:
-        cmd = '"%s" -s GPT_SoVITS/inference_webui_fast.py "%s"' % (python_exec, language)
+        # 本机 venv 是 --system-site-packages + 用户目录分层（torch 在 pyenv 全局、typing_extensions 在 ~/.local），
+        # 上游的 -s 会屏蔽用户 site-packages 导致 import torch 失败，这里去掉 -s（2026-10-17）
+        cmd = '"%s" GPT_SoVITS/inference_webui_fast.py "%s"' % (python_exec, language)
     else:
-        cmd = '"%s" -s GPT_SoVITS/inference_webui.py "%s"' % (python_exec, language)
+        cmd = '"%s" GPT_SoVITS/inference_webui.py "%s"' % (python_exec, language)
     # #####v3暂不支持加速推理
     # if version=="v3":
     #     cmd = '"%s" GPT_SoVITS/inference_webui.py "%s"'%(python_exec, language)
@@ -1272,7 +1276,7 @@ def switch_version(version_):
     set_default()
     return (
         {"__type__": "update", "value": pretrained_sovits_name[version]},
-        {"__type__": "update", "value": pretrained_sovits_name[version].replace("s2G", "s2D")},
+        {"__type__": "update", "value": pretrained_sovits_name[version].replace("s2G", "s2D") if version not in v3v4set else "", "visible": version not in v3v4set},
         {"__type__": "update", "value": pretrained_gpt_name[version]},
         {"__type__": "update", "value": pretrained_gpt_name[version]},
         {"__type__": "update", "value": pretrained_sovits_name[version]},
@@ -1495,7 +1499,7 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
                         version_checkbox = gr.Radio(
                             label=i18n("训练模型的版本"),
                             value=version,
-                            choices=["v1", "v2", "v4", "v2Pro", "v2ProPlus"],
+                            choices=["v2", "v2Pro", "v2ProPlus", "v4", "v5dev", "v5turbo"],
                             scale=5,
                         )
             with gr.Accordion(label=i18n("预训练模型路径"), open=False):
@@ -1519,7 +1523,8 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
                         )
                         pretrained_s2D = gr.Textbox(
                             label=i18n("预训练SoVITS-D模型路径"),
-                            value=pretrained_sovits_name[version].replace("s2G", "s2D"),
+                            value=pretrained_sovits_name[version].replace("s2G", "s2D") if version not in v3v4set else "",
+                            visible=version not in v3v4set,
                             interactive=True,
                             lines=1,
                             max_lines=1,

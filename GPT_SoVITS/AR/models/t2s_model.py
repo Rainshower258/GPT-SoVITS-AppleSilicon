@@ -220,6 +220,54 @@ class T2SBlock:
         )
         return x, k_cache, v_cache
 
+    def decode_next_token_static(
+        self,
+        x: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        kv_len: int,
+        attn_mask: Optional[torch.Tensor] = None,
+        torch_sdpa: bool = True,
+    ):
+        q, k, v = F.linear(x, self.qkv_w, self.qkv_b).chunk(3, dim=-1)
+
+        k_cache.narrow(1, kv_len, 1).copy_(k)
+        v_cache.narrow(1, kv_len, 1).copy_(v)
+        new_len = kv_len + 1
+
+        batch_size = q.shape[0]
+        q_len = q.shape[1]
+
+        q = q.view(batch_size, q_len, self.num_heads, -1).transpose(1, 2)
+        k = k_cache.narrow(1, 0, new_len).view(batch_size, new_len, self.num_heads, -1).transpose(1, 2)
+        v = v_cache.narrow(1, 0, new_len).view(batch_size, new_len, self.num_heads, -1).transpose(1, 2)
+
+        if torch_sdpa:
+            attn = F.scaled_dot_product_attention(q, k, v, (~attn_mask) if attn_mask is not None else None)
+        else:
+            attn = scaled_dot_product_attention(q, k, v, attn_mask)
+
+        attn = attn.transpose(1, 2).reshape(batch_size, q_len, -1)
+        attn = F.linear(attn, self.out_w, self.out_b)
+
+        x = x + attn
+        x = F.layer_norm(
+            x,
+            [self.hidden_dim],
+            self.norm_w1,
+            self.norm_b1,
+            self.norm_eps1,
+        )
+        x = x + self.mlp.forward(x)
+        x = F.layer_norm(
+            x,
+            [self.hidden_dim],
+            self.norm_w2,
+            self.norm_b2,
+            self.norm_eps2,
+        )
+        return x, k_cache, v_cache
+
 
 @torch.jit.script
 class T2STransformer:
@@ -253,6 +301,21 @@ class T2STransformer:
         for i in range(self.num_blocks):
             x, k_cache[i], v_cache[i] = self.blocks[i].decode_next_token(
                 x, k_cache[i], v_cache[i], attn_mask, torch_sdpa
+            )
+        return x, k_cache, v_cache
+
+    def decode_next_token_static(
+        self,
+        x: torch.Tensor,
+        k_cache: List[torch.Tensor],
+        v_cache: List[torch.Tensor],
+        kv_len: int,
+        attn_mask: Optional[torch.Tensor] = None,
+        torch_sdpa: bool = True,
+    ):
+        for i in range(self.num_blocks):
+            x, k_cache[i], v_cache[i] = self.blocks[i].decode_next_token_static(
+                x, k_cache[i], v_cache[i], kv_len, attn_mask, torch_sdpa
             )
         return x, k_cache, v_cache
 
@@ -698,20 +761,48 @@ class Text2SemanticDecoder(nn.Module):
         y_list = [None] * y.shape[0]
         batch_idx_map = list(range(y.shape[0]))
         idx_list = [None] * y.shape[0]
+        kv_len = 0  # 静态 KV cache：静态 buffer 内已写入的长度，仅在 idx==0 之后使用
+        # attn_mask 优化：decode 步的因果性由 kv_len 天然保证（只 attend 已写入的 kv，参见
+        # decode_next_token_static 的 narrow(...,0,new_len)），attn_mask 唯一作用是屏蔽
+        # prompt 里的左 padding 列——这部分内容整段 decode 期间不变，而新生成的 token
+        # 永远不是 padding。若这批数据一开始就没有 padding（batch_size=1 或等长 batch，
+        # 是当前默认场景），decode 阶段可以自始至终对 SDPA 传 None，彻底跳过每步
+        # F.pad + 取反的分配开销。有 padding（bsz>1 且长度不等）时维持原逻辑，不动。
+        decode_has_padding = bool(attn_mask[:, :, -1, :].any())
         for idx in tqdm(range(1500)):
             if idx == 0:
                 xy_dec, k_cache, v_cache = self.t2s_transformer.process_prompt(xy_pos, attn_mask, None)
+                # 静态 KV cache：process_prompt 返回的是恰好 src_len 长的 List[Tensor]，
+                # 拷进按 1500 步上限预分配的静态 buffer，后续 decode 步原地写入，不再 torch.cat
+                max_T = k_cache[0].shape[1] + 1500 + 1
+                kv_len = k_cache[0].shape[1]  # = src_len
+                for i in range(len(k_cache)):
+                    kb = torch.zeros(
+                        k_cache[i].shape[0], max_T, k_cache[i].shape[2],
+                        dtype=k_cache[i].dtype, device=k_cache[i].device,
+                    )
+                    vb = torch.zeros_like(kb)
+                    kb.narrow(1, 0, kv_len).copy_(k_cache[i])
+                    vb.narrow(1, 0, kv_len).copy_(v_cache[i])
+                    k_cache[i], v_cache[i] = kb, vb
             else:
-                xy_dec, k_cache, v_cache = self.t2s_transformer.decode_next_token(xy_pos, k_cache, v_cache, attn_mask)
+                mask_arg = attn_mask if decode_has_padding else None
+                xy_dec, k_cache, v_cache = self.t2s_transformer.decode_next_token_static(
+                    xy_pos, k_cache, v_cache, kv_len, mask_arg
+                )
+                kv_len += 1
             logits = self.ar_predict_layer(xy_dec[:, -1])
 
-            if idx == 0:
-                attn_mask = F.pad(attn_mask[:, :, -1].unsqueeze(-2), (0, 1), value=False)
-            else:
-                attn_mask = F.pad(attn_mask, (0, 1), value=False)
+            if decode_has_padding:
+                if idx == 0:
+                    attn_mask = F.pad(attn_mask[:, :, -1].unsqueeze(-2), (0, 1), value=False)
+                else:
+                    attn_mask = F.pad(attn_mask, (0, 1), value=False)
+            elif idx == 0:
+                attn_mask = None  # 后续步骤统一走上面 decode_has_padding=False 分支，不再需要
 
             if idx < 11:  ###至少预测出10个token不然不给停止（0.4s）
-                logits = logits[:, :-1] 
+                logits = logits[:, :-1]
 
             samples = sample(
                 logits, y, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature
@@ -740,8 +831,13 @@ class Text2SemanticDecoder(nn.Module):
             if reserved_idx_of_batch_for_y is not None:
                 # index = torch.LongTensor(batch_idx_map).to(y.device)
                 y = torch.index_select(y, dim=0, index=reserved_idx_of_batch_for_y)
-                attn_mask = torch.index_select(attn_mask, dim=0, index=reserved_idx_of_batch_for_y)
+                if attn_mask is not None:  # attn_mask 优化：无 padding 场景 attn_mask 恒为 None，无需 index_select
+                    attn_mask = torch.index_select(attn_mask, dim=0, index=reserved_idx_of_batch_for_y)
                 if k_cache is not None:
+                    # 静态 KV cache：k_cache/v_cache 现在是静态 buffer（含未写入的尾部零），
+                    # index_select 会拷贝整个 max_T 长度而不只是已用长度。故意不优化——
+                    # 该分支只在某条序列命中EOS时触发（最多 bsz-1 次，batch_size=1 时触发后立即 break），
+                    # 音质关键路径，正确性优先于这点额外拷贝开销；索引映射方案暂未评估。
                     for i in range(len(k_cache)):
                         k_cache[i] = torch.index_select(k_cache[i], dim=0, index=reserved_idx_of_batch_for_y)
                         v_cache[i] = torch.index_select(v_cache[i], dim=0, index=reserved_idx_of_batch_for_y)
@@ -886,12 +982,30 @@ class Text2SemanticDecoder(nn.Module):
 
         token_counter = 0
         curr_ptr = prefix_len
+        kv_len = 0  # 流式路径：静态 buffer 内已写入的长度，仅在首步之后使用
         for idx in tqdm(range(1500)):
             token_counter+=1
             if xy_attn_mask is not None:
                 xy_dec, k_cache, v_cache = self.t2s_transformer.process_prompt(xy_pos, xy_attn_mask, None)
+                # 流式路径：沿用 infer_panel_batch_infer 中已验证的静态 buffer 模式——
+                # process_prompt 返回恰好 src_len 长的 List[Tensor]，拷进按1500步上限预分配
+                # 的静态buffer，后续 decode 步原地写入，不再 torch.cat。
+                # naive 路径本来就不传 attn_mask 给 decode 步（bsz恒为1，无padding概念），
+                # 不需要 attn_mask 优化中的"有无 padding"判断。
+                max_T = k_cache[0].shape[1] + 1500 + 1
+                kv_len = k_cache[0].shape[1]  # = src_len
+                for i in range(len(k_cache)):
+                    kb = torch.zeros(
+                        k_cache[i].shape[0], max_T, k_cache[i].shape[2],
+                        dtype=k_cache[i].dtype, device=k_cache[i].device,
+                    )
+                    vb = torch.zeros_like(kb)
+                    kb.narrow(1, 0, kv_len).copy_(k_cache[i])
+                    vb.narrow(1, 0, kv_len).copy_(v_cache[i])
+                    k_cache[i], v_cache[i] = kb, vb
             else:
-                xy_dec, k_cache, v_cache = self.t2s_transformer.decode_next_token(xy_pos, k_cache, v_cache)
+                xy_dec, k_cache, v_cache = self.t2s_transformer.decode_next_token_static(xy_pos, k_cache, v_cache, kv_len)
+                kv_len += 1
 
             logits = self.ar_predict_layer(xy_dec[:, -1])
 

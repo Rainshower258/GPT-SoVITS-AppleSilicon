@@ -193,3 +193,13 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# ---- Apple Silicon fork 追加 ----
+# pyopenjtalk 运行时生成的日语用户词典
+GPT_SoVITS/text/ja_userdic/user.dict
+GPT_SoVITS/text/ja_userdic/userdict.md5
+# 基准脚本使用的参考音频、输出音频与临时配置
+bench_mps/ref_audio/
+bench_mps/*.wav
+bench_mps/_scratch_tts_config.yaml
+*.m4a

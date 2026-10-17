@@ -1,3 +1,5 @@
+> 以下为上游 [RVC-Boss/GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) 的原版中文文档。本项目（Apple Silicon 加速，MPS / MLX）的说明见 [中文](../../README.md) · [English](../../README.en.md)。
+
 <div align="center">
 
 <h1>GPT-SoVITS-WebUI</h1>
@@ -20,7 +22,7 @@
 [![License](https://img.shields.io/badge/LICENSE-MIT-green.svg?style=for-the-badge&logo=opensourceinitiative)](https://github.com/RVC-Boss/GPT-SoVITS/blob/main/LICENSE)
 
 
-[**English**](../../README.md) | **中文简体** | [**日本語**](../ja/README.md) | [**한국어**](../ko/README.md) | [**Türkçe**](../tr/README.md)
+[**English**](../../README_UPSTREAM.md) | **中文简体** | [**日本語**](../ja/README.md) | [**한국어**](../ko/README.md) | [**Türkçe**](../tr/README.md)
 
 </div>
 

@@ -57,6 +57,11 @@ def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False)
     )
     y = y.squeeze(1)
     # spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[wnsize_dtype_device],
+    # STFT：return_complex=False 已废弃（新版PyTorch会打 resize 警告，警告原文说未来会直接报错）。
+    # 换成 return_complex=True + view_as_real，数值逐位相同（v2ProPlus/v3/v4 三套真实参数下
+    # max diff 均为 0.0）。**性能上两者没有差别** —— 曾经记录过"快2.5x"，那是微基准预热不足
+    # 导致的假象（先跑的那个总是慢，见 bench_mps/verify_stft.py 开头的说明），已修正。
+    # 保留这个改动纯粹是为了避免将来升级 torch 时直接报错。
     spec = torch.stft(
         y,
         n_fft,
@@ -67,8 +72,9 @@ def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False)
         pad_mode="reflect",
         normalized=False,
         onesided=True,
-        return_complex=False,
+        return_complex=True,
     )
+    spec = torch.view_as_real(spec)
 
     spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-8)
     return spec
@@ -122,6 +128,9 @@ def mel_spectrogram_torch(y, n_fft, num_mels, sampling_rate, hop_size, win_size,
     )
     y = y.squeeze(1)
 
+    # STFT：同 spectrogram_torch 上面那处，数值等价（性能无差别，理由见上面注释）。
+    # 注意这处只有 v3/v4 模型（use_vocoder=True）才会走到，v2ProPlus 不经过这里——
+    # 所以它没有被 e2e 的 md5 A/B 覆盖，是审计时用 v3/v4 真实参数单独验证的。
     spec = torch.stft(
         y,
         n_fft,
@@ -132,8 +141,9 @@ def mel_spectrogram_torch(y, n_fft, num_mels, sampling_rate, hop_size, win_size,
         pad_mode="reflect",
         normalized=False,
         onesided=True,
-        return_complex=False,
+        return_complex=True,
     )
+    spec = torch.view_as_real(spec)
 
     spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-8)
 

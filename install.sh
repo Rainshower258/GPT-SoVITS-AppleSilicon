@@ -65,6 +65,7 @@ fi
 
 USE_CUDA=false
 USE_ROCM=false
+USE_MPS=false
 USE_CPU=false
 WORKFLOW=${WORKFLOW:-"false"}
 
@@ -129,7 +130,7 @@ while [[ $# -gt 0 ]]; do
             USE_ROCM=true
             ;;
         MPS)
-            USE_CPU=true
+            USE_MPS=true
             ;;
         CPU)
             USE_CPU=true
@@ -334,6 +335,10 @@ if [ "$USE_CUDA" = true ] && [ "$WORKFLOW" = false ]; then
 elif [ "$USE_ROCM" = true ] && [ "$WORKFLOW" = false ]; then
     echo -e "${INFO}Installing PyTorch For ROCm 6.2..."
     run_pip_quiet torch torchcodec --index-url "https://download.pytorch.org/whl/rocm6.2"
+elif [ "$USE_MPS" = true ] && [ "$WORKFLOW" = false ]; then
+    # macOS 的标准 PyPI wheel 自带 MPS 支持，不需要像 CPU-only 那样指定单独的 index-url
+    echo -e "${INFO}Installing PyTorch For Apple Silicon (MPS)..."
+    run_pip_quiet torch torchcodec
 elif [ "$USE_CPU" = true ] && [ "$WORKFLOW" = false ]; then
     echo -e "${INFO}Installing PyTorch For CPU..."
     run_pip_quiet torch torchcodec --index-url "https://download.pytorch.org/whl/cpu"
